@@ -25,6 +25,30 @@ class NothingMiddleware
   end
 end
 
+# Records the order in which middleware instances are entered and exited,
+# so tests can verify the actual assembled middleware chain.
+class OrderTrackingMiddleware
+  def self.log
+    @log ||= []
+  end
+
+  def self.reset!
+    @log = []
+  end
+
+  def initialize(app, label)
+    @app = app
+    @label = label
+  end
+
+  def call(env)
+    self.class.log << [:enter, @label]
+    response = @app.call(env)
+    self.class.log << [:exit, @label]
+    response
+  end
+end
+
 describe Rack::Builder do
   def builder(&block)
     Rack::Lint.new Rack::Builder.new(&block)
@@ -276,6 +300,155 @@ describe Rack::Builder do
     proc do
       Rack::Lint.new Rack::Builder.app { use Rack::ShowExceptions }
     end.must_raise(RuntimeError)
+  end
+
+  describe "middleware ordering constraints" do
+    def ordered_app(&block)
+      Rack::Builder.new(&block).to_app
+    end
+
+    def tracked_order(app, path = "/")
+      OrderTrackingMiddleware.reset!
+      Rack::MockRequest.new(app).get(path)
+      OrderTrackingMiddleware.log
+    end
+
+    it "keeps declaration order when no constraints are given" do
+      app = ordered_app do
+        use OrderTrackingMiddleware, :a
+        use OrderTrackingMiddleware, :b
+        use OrderTrackingMiddleware, :c
+        run lambda { |env| [200, { "content-type" => "text/plain" }, ["OK"]] }
+      end
+
+      tracked_order(app).must_equal [
+        [:enter, :a], [:enter, :b], [:enter, :c],
+        [:exit, :c], [:exit, :b], [:exit, :a],
+      ]
+    end
+
+    it "orders middleware using before/after with forward references" do
+      app = ordered_app do
+        use OrderTrackingMiddleware, :audit, before: :auth
+        use OrderTrackingMiddleware, :auth, name: :auth, after: :session
+        use OrderTrackingMiddleware, :session, name: :session
+        run lambda { |env| [200, { "content-type" => "text/plain" }, ["OK"]] }
+      end
+
+      tracked_order(app).must_equal [
+        [:enter, :audit], [:enter, :session], [:enter, :auth],
+        [:exit, :auth], [:exit, :session], [:exit, :audit],
+      ]
+    end
+
+    it "supports multiple names in before/after" do
+      app = ordered_app do
+        use OrderTrackingMiddleware, :c, after: [:a, :b]
+        use OrderTrackingMiddleware, :a, name: :a
+        use OrderTrackingMiddleware, :b, name: :b
+        run lambda { |env| [200, { "content-type" => "text/plain" }, ["OK"]] }
+      end
+
+      tracked_order(app).must_equal [
+        [:enter, :a], [:enter, :b], [:enter, :c],
+        [:exit, :c], [:exit, :b], [:exit, :a],
+      ]
+    end
+
+    it "distinguishes multiple uses of the same middleware class by name" do
+      app = ordered_app do
+        use OrderTrackingMiddleware, :inner, name: :inner
+        use OrderTrackingMiddleware, :outer, before: :inner
+        run lambda { |env| [200, { "content-type" => "text/plain" }, ["OK"]] }
+      end
+
+      tracked_order(app).must_equal [
+        [:enter, :outer], [:enter, :inner],
+        [:exit, :inner], [:exit, :outer],
+      ]
+    end
+
+    it "scopes constraints to the map stack they are declared in" do
+      app = ordered_app do
+        use OrderTrackingMiddleware, :outer, name: :outer
+        map '/sub' do
+          use OrderTrackingMiddleware, :inner_b, before: :inner_a
+          use OrderTrackingMiddleware, :inner_a, name: :inner_a
+          run lambda { |env| [200, { "content-type" => "text/plain" }, ["sub"]] }
+        end
+        run lambda { |env| [200, { "content-type" => "text/plain" }, ["root"]] }
+      end
+
+      tracked_order(app, "/sub").must_equal [
+        [:enter, :outer], [:enter, :inner_b], [:enter, :inner_a],
+        [:exit, :inner_a], [:exit, :inner_b], [:exit, :outer],
+      ]
+      tracked_order(app, "/").must_equal [
+        [:enter, :outer], [:exit, :outer],
+      ]
+    end
+
+    it "does not resolve names from enclosing stacks inside map" do
+      error = proc do
+        ordered_app do
+          use OrderTrackingMiddleware, :outer, name: :outer
+          map '/sub' do
+            use OrderTrackingMiddleware, :inner, after: :outer
+            run lambda { |env| [200, { "content-type" => "text/plain" }, ["sub"]] }
+          end
+          run lambda { |env| [200, { "content-type" => "text/plain" }, ["root"]] }
+        end
+      end.must_raise(Rack::Builder::OrderingError)
+
+      error.message.must_include ":outer"
+    end
+
+    it "raises a readable error for unknown names at build time" do
+      error = proc do
+        ordered_app do
+          use OrderTrackingMiddleware, :audit, before: :auth
+          run lambda { |env| [200, { "content-type" => "text/plain" }, ["OK"]] }
+        end
+      end.must_raise(Rack::Builder::OrderingError)
+
+      error.message.must_include ":auth"
+      error.message.must_include "before"
+    end
+
+    it "raises a readable error for duplicate names at build time" do
+      error = proc do
+        ordered_app do
+          use OrderTrackingMiddleware, :a, name: :dup
+          use OrderTrackingMiddleware, :b, name: :dup
+          run lambda { |env| [200, { "content-type" => "text/plain" }, ["OK"]] }
+        end
+      end.must_raise(Rack::Builder::OrderingError)
+
+      error.message.must_include ":dup"
+    end
+
+    it "raises a readable error with the cycle chain at build time" do
+      error = proc do
+        ordered_app do
+          use OrderTrackingMiddleware, :a, name: :a, before: :b
+          use OrderTrackingMiddleware, :b, name: :b, before: :c
+          use OrderTrackingMiddleware, :c, name: :c, before: :a
+          run lambda { |env| [200, { "content-type" => "text/plain" }, ["OK"]] }
+        end
+      end.must_raise(Rack::Builder::OrderingError)
+
+      error.message.must_include "cycle"
+      error.message.must_match(/:a.*->.*:b.*->.*:c.*->.*:a/)
+    end
+
+    it "treats a constraint on the middleware's own name as a cycle" do
+      proc do
+        ordered_app do
+          use OrderTrackingMiddleware, :a, name: :a, before: :a
+          run lambda { |env| [200, { "content-type" => "text/plain" }, ["OK"]] }
+        end
+      end.must_raise(Rack::Builder::OrderingError)
+    end
   end
 
   describe "parse_file" do

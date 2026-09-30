@@ -34,6 +34,40 @@ module Rack
   # +use+ adds middleware to the stack, +run+ dispatches to an application.
   # You can use +map+ to construct a Rack::URLMap in a convenient way.
   class Builder
+    # Error raised when the middleware ordering constraints declared via
+    # the +before+ and +after+ options of #use cannot be satisfied, either
+    # because they reference an unknown or ambiguous name, or because they
+    # form a cycle.
+    class OrderingError < ArgumentError; end
+
+    # @private
+    # Internal representation of a single #use statement: the proc that
+    # instantiates the middleware, plus an optional local name and the
+    # ordering constraints declared for it.
+    class UseEntry
+      attr_reader :name, :before, :after
+
+      def initialize(wrapper, label, name = nil, before = nil, after = nil)
+        @wrapper = wrapper
+        @label = label
+        @name = name
+        @before = Array(before)
+        @after = Array(after)
+      end
+
+      def call(app)
+        @wrapper.call(app)
+      end
+      alias [] call
+
+      def constrained?
+        !!@name || !@before.empty? || !@after.empty?
+      end
+
+      def to_s
+        @name ? "#{@label} (named #{@name.inspect})" : @label
+      end
+    end
 
     # https://stackoverflow.com/questions/2223882/whats-the-difference-between-utf-8-and-utf-8-without-bom
     UTF_8_BOM = '\xef\xbb\xbf'
@@ -156,12 +190,30 @@ module Rack
     # All requests through to this application will first be processed by the middleware class.
     # The +call+ method in this example sets an additional environment key which then can be
     # referenced in the application if required.
-    def use(middleware, ...)
+    #
+    # Middleware can be given a local +name+, and ordered relative to other
+    # named middleware in the same stack using +before+ and +after+:
+    #
+    #   use SessionMiddleware, name: :session
+    #   use AuditMiddleware, before: :auth
+    #   use AuthMiddleware, name: :auth, after: :session
+    #
+    # +before+ and +after+ accept a single name or an array of names, and may
+    # reference middleware declared later in the same stack (forward
+    # references).  Constraints are resolved per stack: middleware declared
+    # inside a +map+ block is ordered independently of middleware outside it.
+    # Middleware without constraints keeps its declaration order.  Unknown
+    # names, duplicate names, and cyclic constraints raise
+    # Rack::Builder::OrderingError when the application is built.
+    #
+    # Note that +name+, +before+, and +after+ are reserved keywords and are
+    # not passed on to the middleware.
+    def use(middleware, *args, name: nil, before: nil, after: nil, **kwargs, &block)
       if @map
         mapping, @map = @map, nil
-        @use << proc { |app| generate_map(app, mapping) }
+        @use << UseEntry.new(proc { |app| generate_map(app, mapping) }, "map(#{mapping.keys.join(', ')})")
       end
-      @use << proc { |app| middleware.new(app, ...) }
+      @use << UseEntry.new(proc { |app| middleware.new(app, *args, **kwargs, &block) }, middleware.to_s, name, before, after)
 
       nil
     end
@@ -268,7 +320,7 @@ module Rack
       app = @map ? generate_map(@run, @map) : @run
       fail "missing run or map statement" unless app
       app.freeze if @freeze_app
-      app = @use.reverse.inject(app) { |a, e| e[a].tap { |x| x.freeze if @freeze_app } }
+      app = resolve_order(@use).reverse.inject(app) { |a, e| e[a].tap { |x| x.freeze if @freeze_app } }
       @warmup.call(app) if @warmup
       app
     end
@@ -288,6 +340,94 @@ module Rack
       mapped = default_app ? { '/' => default_app } : {}
       mapping.each { |r, b| mapped[r] = self.class.new(default_app, &b).to_app }
       URLMap.new(mapped)
+    end
+
+    # Resolve the final middleware order, honoring the +before+/+after+
+    # constraints declared via #use.  Entries without constraints keep
+    # their relative declaration order.  Raises OrderingError if a
+    # constraint refers to an unknown name, a name is declared more than
+    # once, or the constraints form a cycle.
+    def resolve_order(entries)
+      return entries unless entries.any?(&:constrained?)
+
+      index_by_name = {}
+      entries.each_with_index do |entry, index|
+        next unless entry.name
+        if index_by_name.key?(entry.name)
+          raise OrderingError, "duplicate middleware name #{entry.name.inspect} declared by #{entry}"
+        end
+        index_by_name[entry.name] = index
+      end
+
+      # edges[i] lists the indexes of the entries that must come after
+      # entries[i].
+      edges = Array.new(entries.size) { [] }
+      entries.each_with_index do |entry, index|
+        entry.before.each do |ref|
+          edges[index] << constraint_index(index_by_name, entry, ref, :before)
+        end
+        entry.after.each do |ref|
+          edges[constraint_index(index_by_name, entry, ref, :after)] << index
+        end
+      end
+
+      # Stable topological sort: among the entries that may be placed next,
+      # always pick the one declared first, so unconstrained entries keep
+      # their original relative order.
+      incoming = Array.new(entries.size, 0)
+      edges.each { |targets| targets.each { |target| incoming[target] += 1 } }
+      remaining = (0...entries.size).to_a
+      order = []
+      until remaining.empty?
+        index = remaining.find { |candidate| incoming[candidate].zero? }
+        unless index
+          chain = find_cycle(edges, remaining).map { |i| entries[i].to_s }.join(' -> ')
+          raise OrderingError, "middleware ordering constraints contain a cycle: #{chain}"
+        end
+        order << entries[index]
+        remaining.delete(index)
+        edges[index].each { |target| incoming[target] -= 1 }
+      end
+      order
+    end
+
+    # Look up the index of the middleware named +ref+, raising a readable
+    # OrderingError if no middleware in this stack carries that name.
+    def constraint_index(index_by_name, entry, ref, relation)
+      index_by_name.fetch(ref) do
+        raise OrderingError, "#{entry} declares #{relation}: #{ref.inspect}, but no middleware in this stack is named #{ref.inspect}"
+      end
+    end
+
+    # Find one concrete cycle among the entry indexes in +candidates+,
+    # returning the indexes forming the cycle (with the first index
+    # repeated at the end) so it can be shown as a readable chain.
+    def find_cycle(edges, candidates)
+      allowed = candidates.to_h { |i| [i, true] }
+      state = {}
+      path = []
+      visit = lambda do |node|
+        state[node] = :visiting
+        path << node
+        edges[node].each do |target|
+          next unless allowed[target]
+          if state[target] == :visiting
+            return path[path.index(target)..] + [target]
+          elsif state[target].nil?
+            cycle = visit.call(target)
+            return cycle if cycle
+          end
+        end
+        path.pop
+        state[node] = :visited
+        nil
+      end
+      candidates.each do |node|
+        next if state[node]
+        cycle = visit.call(node)
+        return cycle if cycle
+      end
+      nil
     end
   end
 end
