@@ -25,6 +25,21 @@ class NothingMiddleware
   end
 end
 
+class OrderedMiddleware
+  def initialize(app, name, events)
+    @app = app
+    @name = name
+    @events = events
+  end
+
+  def call(env)
+    @events << [:enter, @name]
+    response = @app.call(env)
+    @events << [:exit, @name]
+    response
+  end
+end
+
 describe Rack::Builder do
   def builder(&block)
     Rack::Lint.new Rack::Builder.new(&block)
@@ -249,6 +264,177 @@ describe Rack::Builder do
     Rack::MockRequest.new(app).get("/").must_be :server_error?
     Rack::MockRequest.new(app).get("/").must_be :server_error?
     Rack::MockRequest.new(app).get("/").must_be :server_error?
+  end
+
+  it "preserves the call order of unconstrained middleware" do
+    events = []
+    app = builder_to_app do
+      use OrderedMiddleware, :session, events
+      use OrderedMiddleware, :audit, events
+      use OrderedMiddleware, :auth, events
+      run lambda { |env| events << :app; [200, { "content-type" => "text/plain" }, ["OK"]] }
+    end
+
+    Rack::MockRequest.new(app).get("/")
+
+    events.must_equal [
+      [:enter, :session], [:enter, :audit], [:enter, :auth], :app,
+      [:exit, :auth], [:exit, :audit], [:exit, :session]
+    ]
+  end
+
+  it "orders named middleware using forward references" do
+    events = []
+    app = builder_to_app do
+      use OrderedMiddleware, :auth, events, as: :auth, after: :session
+      use OrderedMiddleware, :audit, events, as: :audit, after: :session, before: :auth
+      use OrderedMiddleware, :session, events, as: :session
+      run lambda { |env| events << :app; [200, { "content-type" => "text/plain" }, ["OK"]] }
+    end
+
+    Rack::MockRequest.new(app).get("/")
+
+    events.must_equal [
+      [:enter, :session], [:enter, :audit], [:enter, :auth], :app,
+      [:exit, :auth], [:exit, :audit], [:exit, :session]
+    ]
+  end
+
+  it "orders middleware using arrays of references" do
+    events = []
+    app = builder_to_app do
+      use OrderedMiddleware, :audit, events, as: :audit, after: [:session, :request_id]
+      use OrderedMiddleware, :auth, events, as: :auth, after: :audit
+      use OrderedMiddleware, :session, events, as: :session
+      use OrderedMiddleware, :request_id, events, as: :request_id
+      run lambda { |env| events << :app; [200, { "content-type" => "text/plain" }, ["OK"]] }
+    end
+
+    Rack::MockRequest.new(app).get("/")
+
+    events.must_equal [
+      [:enter, :session], [:enter, :request_id], [:enter, :audit], [:enter, :auth], :app,
+      [:exit, :auth], [:exit, :audit], [:exit, :request_id], [:exit, :session]
+    ]
+  end
+
+  it "does not forward ordering metadata to middleware" do
+    received_keywords = nil
+    middleware = Class.new do
+      define_method(:initialize) do |app, **keywords|
+        @app = app
+        received_keywords = keywords
+      end
+
+      define_method(:call) do |env|
+        @app.call(env)
+      end
+    end
+
+    app = builder_to_app do
+      use middleware, as: :named, before: :other, enabled: true
+      use middleware, as: :other
+      run lambda { |env| [200, { "content-type" => "text/plain" }, ["OK"]] }
+    end
+
+    Rack::MockRequest.new(app).get("/")
+    received_keywords.must_equal(enabled: true)
+  end
+
+  it "allows repeated middleware classes with different names" do
+    events = []
+    app = builder_to_app do
+      use OrderedMiddleware, :inner_audit, events, as: :inner_audit, after: :outer_audit
+      use OrderedMiddleware, :outer_audit, events, as: :outer_audit, before: :inner_audit
+      run lambda { |env| events << :app; [200, { "content-type" => "text/plain" }, ["OK"]] }
+    end
+
+    Rack::MockRequest.new(app).get("/")
+
+    events.must_equal [
+      [:enter, :outer_audit], [:enter, :inner_audit], :app,
+      [:exit, :inner_audit], [:exit, :outer_audit]
+    ]
+  end
+
+  it "scopes ordering constraints inside mapped stacks" do
+    events = []
+    app = builder_to_app do
+      use OrderedMiddleware, :outer_auth, events, as: :auth, after: :session
+      use OrderedMiddleware, :outer_session, events, as: :session
+      map '/sub' do
+        use OrderedMiddleware, :inner_auth, events, as: :auth, after: :session
+        use OrderedMiddleware, :inner_session, events, as: :session
+        run lambda { |env| [200, { "content-type" => "text/plain" }, ["sub"]] }
+      end
+      run lambda { |env| [200, { "content-type" => "text/plain" }, ["root"]] }
+    end
+
+    Rack::MockRequest.new(app).get("/sub")
+
+    events.must_equal [
+      [:enter, :outer_session], [:enter, :outer_auth],
+      [:enter, :inner_session], [:enter, :inner_auth],
+      [:exit, :inner_auth], [:exit, :inner_session],
+      [:exit, :outer_auth], [:exit, :outer_session]
+    ]
+  end
+
+  it "does not resolve outer middleware names from mapped stacks" do
+    proc do
+      builder_to_app do
+        map '/sub' do
+          use OrderedMiddleware, :inner, [], as: :inner
+          run lambda { |env| [200, {}, []] }
+        end
+        use OrderedMiddleware, :outer, [], as: :outer, after: :inner
+        run lambda { |env| [200, {}, []] }
+      end
+    end.must_raise(RuntimeError).message.must_equal "middleware not found: :inner"
+  end
+
+  it "does not resolve outer middleware names inside mapped stacks" do
+    proc do
+      builder_to_app do
+        use OrderedMiddleware, :outer, [], as: :outer
+        map '/sub' do
+          use OrderedMiddleware, :inner, [], as: :inner, after: :outer
+          run lambda { |env| [200, {}, []] }
+        end
+        run lambda { |env| [200, {}, []] }
+      end
+    end.must_raise(RuntimeError).message.must_equal "middleware not found: :outer"
+  end
+
+  it "raises for missing middleware names when building" do
+    proc do
+      builder_to_app do
+        use OrderedMiddleware, :audit, [], as: :audit, before: :auth
+        run lambda { |env| [200, {}, []] }
+      end
+    end.must_raise(RuntimeError).message.must_equal "middleware not found: :auth"
+  end
+
+  it "raises for duplicate middleware names when building" do
+    proc do
+      builder_to_app do
+        use OrderedMiddleware, :first, [], as: :audit
+        use OrderedMiddleware, :second, [], as: :audit
+        run lambda { |env| [200, {}, []] }
+      end
+    end.must_raise(RuntimeError).message.must_equal "duplicate middleware names: :audit"
+  end
+
+  it "raises a readable dependency cycle when building" do
+    error = proc do
+      builder_to_app do
+        use OrderedMiddleware, :audit, [], as: :audit, before: :auth
+        use OrderedMiddleware, :auth, [], as: :auth, before: :audit
+        run lambda { |env| [200, {}, []] }
+      end
+    end.must_raise(RuntimeError)
+
+    error.message.must_equal "middleware dependency cycle: :audit -> :auth -> :audit"
   end
 
   it "supports #freeze_app for freezing app and middleware" do
