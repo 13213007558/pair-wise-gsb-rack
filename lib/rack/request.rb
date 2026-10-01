@@ -647,6 +647,20 @@ module Rack
         self.GET.merge(self.POST)
       end
 
+      # The union of GET and POST data, parsed in strict mode.
+      #
+      # Unlike #params, which silently keeps the POST value when the same
+      # parameter is present in both the query string and the request body,
+      # this raises Rack::QueryParser::ParameterConflictError identifying the
+      # conflicting input segments and their sources. Duplicate assignments
+      # within a single source are rejected as well. See
+      # Rack::QueryParser#parse_nested_query_strict for details.
+      def strict_params
+        parser = query_parser
+        result = parser.parse_nested_query_strict(query_string, '&', source: 'query string')
+        result.merge(strict_form_params(parser)).params
+      end
+
       # Allow overriding the query parser that the receiver will use.
       # By default Rack::Utils.default_query_parser is used.
       attr_writer :query_parser
@@ -788,6 +802,19 @@ module Rack
         end
 
         params.to_params_hash
+      end
+
+      # Returns the POST data as a Rack::QueryParser::StrictResult, for use
+      # by #strict_params. URL-encoded form data is parsed from the raw
+      # request body so that byte ranges are recorded; other input (such as
+      # multipart form data) is expanded from the already parsed pairs.
+      def strict_form_params(query_parser = query_parser())
+        pairs = form_pairs
+        if form_vars = get_header(RACK_REQUEST_FORM_VARS)
+          query_parser.parse_nested_query_strict(form_vars, '&', source: 'request body')
+        else
+          query_parser.normalize_pairs_strict(pairs, source: 'request body')
+        end
       end
 
       def split_header(value)

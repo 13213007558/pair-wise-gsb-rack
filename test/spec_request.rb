@@ -704,6 +704,35 @@ class RackRequestTest < Minitest::Spec
     req.params.must_equal req.GET.merge(req.POST)
   end
 
+  it "strict_params merges query string and form params" do
+    req = make_request(Rack::MockRequest.env_for("/?foo=get&shared[a]=1",
+      "REQUEST_METHOD" => 'POST',
+      :input => "bar=post&shared[b]=2"))
+    req.strict_params.must_equal "foo" => "get", "shared" => { "a" => "1", "b" => "2" }, "bar" => "post"
+  end
+
+  it "strict_params raises ParameterConflictError identifying both sources" do
+    req = make_request(Rack::MockRequest.env_for("/?shared=get",
+      "REQUEST_METHOD" => 'POST',
+      :input => "shared=post"))
+    error = proc { req.strict_params }.must_raise Rack::QueryParser::ParameterConflictError
+    error.message.must_include "in query string"
+    error.message.must_include "in request body"
+  end
+
+  it "strict_params rejects duplicate assignments within the query string" do
+    req = make_request(Rack::MockRequest.env_for("/?a=1&a=2"))
+    proc { req.strict_params }.must_raise Rack::QueryParser::ParameterConflictError
+  end
+
+  it "strict_params rejects duplicate assignments within the request body" do
+    req = make_request(Rack::MockRequest.env_for("/",
+      "REQUEST_METHOD" => 'POST',
+      :input => "a[b]=1&a%5Bb%5D=2"))
+    error = proc { req.strict_params }.must_raise Rack::QueryParser::ParameterConflictError
+    error.message.must_include "a%5Bb%5D"
+  end
+
   it "should use the query_parser set via attr_writer for query parsing" do
     c = Class.new(Rack::QueryParser::Params) do
       def initialize(*)
