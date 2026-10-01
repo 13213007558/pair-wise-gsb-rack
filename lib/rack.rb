@@ -58,6 +58,7 @@ module Rack
 
   module Auth
     autoload :Basic, "rack/auth/basic"
+    autoload :Signature, "rack/auth/signature"
     autoload :AbstractHandler, "rack/auth/abstract/handler"
     autoload :AbstractRequest, "rack/auth/abstract/request"
   end
