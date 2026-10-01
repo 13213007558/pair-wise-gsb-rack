@@ -35,6 +35,7 @@ module Rack
   autoload :Lint, "rack/lint"
   autoload :Lock, "rack/lock"
   autoload :MediaType, "rack/media_type"
+  autoload :MessageSignatures, "rack/message_signatures"
   autoload :MethodOverride, "rack/method_override"
   autoload :Mime, "rack/mime"
   autoload :MockRequest, "rack/mock_request"
