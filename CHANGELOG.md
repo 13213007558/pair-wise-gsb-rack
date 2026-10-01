@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file. For info on
 
 ### Added
 
+- Add `Rack::QueryParser#parse_nested_query_strict`, a strict parsing mode that records the original key and byte range of every leaf value, rejects duplicate scalar assignments to the same parameter path, and supports conflict-checked merging of parameters from different sources (such as a query string and a form body).
 - Add `Rack::Files#assign_headers` to allow overriding how the configured file headers are set. ([#2377](https://github.com/rack/rack/pull/2377), [@codergeek121](https://github.com/codergeek121))
 - Add support for `rack.response_finished` to `Rack::TempfileReaper`. ([#2363](https://github.com/rack/rack/pull/2363), [@skipkayhil](https://github.com/skipkayhil))
 - Add support for streaming bodies when using `Rack::Events`. ([#2375](github.com/rack/rack/pull/2375), [@unflxw](https://github.com/unflxw))
