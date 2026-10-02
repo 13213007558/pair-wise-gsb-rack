@@ -52,6 +52,7 @@ module Rack
   autoload :ShowExceptions, "rack/show_exceptions"
   autoload :ShowStatus, "rack/show_status"
   autoload :Static, "rack/static"
+  autoload :StructuredFields, "rack/structured_fields"
   autoload :TempfileReaper, "rack/tempfile_reaper"
   autoload :URLMap, "rack/urlmap"
   autoload :Utils, "rack/utils"
