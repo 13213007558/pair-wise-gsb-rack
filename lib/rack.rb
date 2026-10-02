@@ -16,6 +16,7 @@ require_relative 'rack/constants'
 
 module Rack
   autoload :BadRequest, "rack/bad_request"
+  autoload :BinaryHTTP, "rack/binary_http"
   autoload :BodyProxy, "rack/body_proxy"
   autoload :Builder, "rack/builder"
   autoload :Cascade, "rack/cascade"
